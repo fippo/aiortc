@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Set
 
-from av.frame import Frame
+#from av.frame import Frame
 
 from . import clock
 from .codecs import depayload, get_capabilities, get_decoder, is_rtx
@@ -193,18 +193,18 @@ class RemoteStreamTrack(MediaStreamTrack):
             self._id = id
         self._queue: asyncio.Queue = asyncio.Queue()
 
-    async def recv(self) -> Frame:
-        """
-        Receive the next frame.
-        """
-        if self.readyState != "live":
-            raise MediaStreamError
-
-        frame = await self._queue.get()
-        if frame is None:
-            self.stop()
-            raise MediaStreamError
-        return frame
+#    async def recv(self) -> Frame:
+#        """
+#        Receive the next frame.
+#        """
+#        if self.readyState != "live":
+#            raise MediaStreamError
+#
+#        frame = await self._queue.get()
+#        if frame is None:
+#            self.stop()
+#            raise MediaStreamError
+#        return frame
 
 
 class TimestampMapper:

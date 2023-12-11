@@ -14,7 +14,7 @@ from .rtcrtpparameters import (
     RTCRtpHeaderExtensionParameters,
     RTCRtpParameters,
 )
-from .rtcsctptransport import RTCSctpCapabilities
+#from .rtcsctptransport import RTCSctpCapabilities
 
 DIRECTIONS = ["inactive", "sendonly", "recvonly", "sendrecv"]
 

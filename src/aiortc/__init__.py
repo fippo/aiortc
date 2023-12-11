@@ -1,12 +1,12 @@
 # ruff: noqa: F401
 import logging
 
-import av.logging
+#import av.logging
 
 from .exceptions import InvalidAccessError, InvalidStateError
-from .mediastreams import MediaStreamTrack, VideoStreamTrack
+#from .mediastreams import MediaStreamTrack, VideoStreamTrack
 from .rtcconfiguration import RTCConfiguration, RTCIceServer
-from .rtcdatachannel import RTCDataChannel, RTCDataChannelParameters
+#from .rtcdatachannel import RTCDataChannel, RTCDataChannelParameters
 from .rtcdtlstransport import (
     RTCCertificate,
     RTCDtlsFingerprint,
@@ -19,7 +19,7 @@ from .rtcicetransport import (
     RTCIceParameters,
     RTCIceTransport,
 )
-from .rtcpeerconnection import RTCPeerConnection
+#from .rtcpeerconnection import RTCPeerConnection
 from .rtcrtpparameters import (
     RTCRtcpParameters,
     RTCRtpCapabilities,
@@ -29,14 +29,14 @@ from .rtcrtpparameters import (
     RTCRtpHeaderExtensionParameters,
     RTCRtpParameters,
 )
-from .rtcrtpreceiver import (
-    RTCRtpContributingSource,
-    RTCRtpReceiver,
-    RTCRtpSynchronizationSource,
-)
-from .rtcrtpsender import RTCRtpSender
-from .rtcrtptransceiver import RTCRtpTransceiver
-from .rtcsctptransport import RTCSctpCapabilities, RTCSctpTransport
+# from .rtcrtpreceiver import (
+#     RTCRtpContributingSource,
+#     RTCRtpReceiver,
+#     RTCRtpSynchronizationSource,
+# )
+#from .rtcrtpsender import RTCRtpSender
+#from .rtcrtptransceiver import RTCRtpTransceiver
+#from .rtcsctptransport import RTCSctpCapabilities, RTCSctpTransport
 from .rtcsessiondescription import RTCSessionDescription
 from .stats import (
     RTCInboundRtpStreamStats,
@@ -50,7 +50,7 @@ from .stats import (
 __version__ = "1.6.0"
 
 # Disable PyAV's logging framework as it can lead to thread deadlocks.
-av.logging.restore_default_callback()
+#av.logging.restore_default_callback()
 
 # Set default logging handler to avoid "No handler found" warnings.
 logging.getLogger(__name__).addHandler(logging.NullHandler())
