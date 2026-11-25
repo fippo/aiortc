@@ -429,6 +429,7 @@ class RTCPeerConnection(AsyncIOEventEmitter):
         self.__sctpRemoteCaps: Optional[RTCSctpCapabilities] = None
         self.__stream_id = str(uuid.uuid4())
         self.__transceivers: list[RTCRtpTransceiver] = []
+        self.__removedTransceivers: set[RTCRtpTransceiver] = set()
 
         self.__closeTask: Optional[asyncio.Task] = None
         self.__connectionState = "new"
@@ -585,13 +586,13 @@ class RTCPeerConnection(AsyncIOEventEmitter):
         # don't add track twice
         self.__assertTrackHasNoSender(track)
 
-        # Reuse a transceiver without a track, unless it is stopped (W3C
+        # Reuse a transceiver without a track, unless it is stopping (W3C
         # webrtc-pc, addTrack).
         for transceiver in self.__transceivers:
             if (
                 transceiver.kind == track.kind
                 and transceiver.sender.track is None
-                and not transceiver.stopped
+                and not transceiver._stopping
             ):
                 transceiver.sender.replaceTrack(track)
                 transceiver.direction = or_direction(transceiver.direction, "sendonly")
@@ -644,7 +645,7 @@ class RTCPeerConnection(AsyncIOEventEmitter):
 
         # stop senders / receivers
         for transceiver in self.__transceivers:
-            await transceiver.stop()
+            await transceiver._stop()
         if self.__sctp:
             await self.__sctp.stop()
 
@@ -703,7 +704,7 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                     ),
                     mid=transceiver.mid,
                 )
-                if transceiver.stopped:
+                if transceiver._stopping:
                     stopped.append((media, remote_m))
                 dtlsTransport = transceiver.receiver.transport
             else:
@@ -815,7 +816,7 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                     direction=transceiver.direction,
                     mid=mid,
                 )
-                if transceiver.stopped:
+                if transceiver._stopping:
                     stopped.append((media, media))
                 description.media.append(media)
             elif media_kind == "application":
@@ -847,7 +848,7 @@ class RTCPeerConnection(AsyncIOEventEmitter):
             add_datachannel_section()
 
         for transceiver in filter(
-            lambda x: x.mid is None and not x.stopped, self.__transceivers
+            lambda x: x.mid is None and not x._stopping, self.__transceivers
         ):
             transceiver._set_mline_index(next_mline_index())
             description.media.append(
@@ -877,14 +878,14 @@ class RTCPeerConnection(AsyncIOEventEmitter):
         Returns the list of :class:`RTCRtpReceiver` objects that are currently
         attached to the connection.
         """
-        return list(map(lambda x: x.receiver, self.__transceivers))
+        return [t.receiver for t in self.getTransceivers() if not t.stopped]
 
     def getSenders(self) -> list[RTCRtpSender]:
         """
         Returns the list of :class:`RTCRtpSender` objects that are currently
         attached to the connection.
         """
-        return list(map(lambda x: x.sender, self.__transceivers))
+        return [t.sender for t in self.getTransceivers() if not t.stopped]
 
     async def getStats(self) -> RTCStatsReport:
         """
@@ -905,7 +906,7 @@ class RTCPeerConnection(AsyncIOEventEmitter):
         Returns the list of :class:`RTCRtpTransceiver` objects that are currently
         attached to the connection.
         """
-        return list(self.__transceivers)
+        return [t for t in self.__transceivers if t not in self.__removedTransceivers]
 
     async def setLocalDescription(
         self, sessionDescription: Optional[RTCSessionDescription] = None
@@ -972,10 +973,10 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                 elif media.kind == "application":
                     self.__sctp.transport._set_role(media.dtls.role)
 
-        # Configure the directions, which are inactive for stopped transceivers.
+        # Configure the directions, which are inactive for stopping transceivers.
         for t in self.__transceivers:
             if description.type in ["answer", "pranswer"]:
-                if t.stopped:
+                if t._stopping:
                     t._setCurrentDirection("inactive")
                 else:
                     t._setCurrentDirection(
@@ -994,6 +995,16 @@ class RTCPeerConnection(AsyncIOEventEmitter):
             self.__setSignalingState("have-local-offer")
         elif description.type == "answer":
             self.__setSignalingState("stable")
+
+        # An answer stops the transceivers of the "m=" sections it rejects.
+        if description.type == "answer":
+            for i, media in enumerate(description.media):
+                if media.kind in ["audio", "video"] and is_rejected(media):
+                    transceiver = self.__getTransceiverByMLineIndex(i)
+                    if not transceiver.stopped:
+                        await transceiver._stop()
+            self.__removeRejectedTransceivers()
+            await self.__discardUnusedTransports()
 
         # Gather candidates and add them to the stored description. A pending
         # __connect() task may run meanwhile, as the description is applied.
@@ -1169,7 +1180,9 @@ class RTCPeerConnection(AsyncIOEventEmitter):
         # Stop the transceivers of rejected "m=" sections.
         for transceiver in rejectedTransceivers:
             if not transceiver.stopped:
-                await transceiver.stop()
+                await transceiver._stop()
+        if description.type == "answer":
+            self.__removeRejectedTransceivers()
 
         # Move the bundled media to the transport of the BUNDLE-tagged section.
         bundle = next((x for x in description.group if x.semantic == "BUNDLE"), None)
@@ -1351,9 +1364,11 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                 dtlsTransport = self.__sctp.transport
                 bundled = True
         elif self.__configuration.bundlePolicy == RTCBundlePolicy.BALANCED:
-            # The transport of a stopped transceiver may have been discarded.
+            # The transport of a stopping transceiver is about to be discarded.
             transceiver = next(
-                filter(lambda t: t.kind == kind and not t.stopped, self.__transceivers),
+                filter(
+                    lambda t: t.kind == kind and not t._stopping, self.__transceivers
+                ),
                 None,
             )
             if transceiver:
@@ -1400,6 +1415,26 @@ class RTCPeerConnection(AsyncIOEventEmitter):
         self.__updateIceConnectionState()
         self.__updateConnectionState()
         return unused
+
+    def __removeRejectedTransceivers(self) -> None:
+        """
+        Remove the stopped transceivers whose "m=" section is rejected (W3C
+        webrtc-pc, set the session description). They are kept internally, as
+        offers and answers still include their "m=" sections.
+        """
+        rejected = {
+            media.rtp.muxId
+            for description in [
+                self.__currentLocalDescription,
+                self.__currentRemoteDescription,
+            ]
+            if description is not None
+            for media in description.media
+            if is_rejected(media)
+        }
+        for transceiver in self.__transceivers:
+            if transceiver.stopped and transceiver.mid in rejected:
+                self.__removedTransceivers.add(transceiver)
 
     def __getTransceiverByMid(self, mid: str) -> Optional[RTCRtpTransceiver]:
         return next(filter(lambda x: x.mid == mid, self.__transceivers), None)

@@ -883,14 +883,14 @@ class RTCPeerConnectionTest(TestCase):
     async def test_addTrack_stopped_transceiver(self) -> None:
         pc = RTCPeerConnection()
 
-        # A stopped transceiver is not reused, even if it has no track.
+        # A stopping transceiver is not reused, even if it has no track.
         stopped = pc.addTransceiver("audio")
         await stopped.stop()
         track = AudioStreamTrack()
         sender = pc.addTrack(track)
         self.assertIsNone(stopped.sender.track)
         self.assertEqual(sender.track, track)
-        self.assertEqual(len(pc.getTransceivers()), 2)
+        self.assertEqual(pc.getSenders(), [stopped.sender, sender])
 
         await pc.close()
 
@@ -917,11 +917,14 @@ class RTCPeerConnectionTest(TestCase):
         self.assertEqual(transceiver.stopped, False)
         self.assertEqual(len(pc.getTransceivers()), 1)
 
-        # stop transceiver
+        # stop transceiver, which is only stopped once negotiated or closed
         await transceiver.stop()
         self.assertEqual(transceiver.currentDirection, None)
         self.assertEqual(transceiver.direction, "sendonly")
         self.assertEqual(transceiver.sender.track, track)
+        self.assertEqual(transceiver.stopped, False)
+
+        await pc.close()
         self.assertEqual(transceiver.stopped, True)
 
     @asynctest
@@ -2263,6 +2266,7 @@ a=rtpmap:8 PCMA/8000
 
         await negotiate(pc1, pc2)
         await self.assertIceCompleted(pc1, pc2)
+        pc1_transceiver = pc1.getTransceivers()[0]
 
         # The answer rejects the "m=" section of the stopped transceiver
         # (RFC 9429 section 5.3.1).
@@ -2273,9 +2277,23 @@ a=rtpmap:8 PCMA/8000
 
         # Applying the answer stops the offerer's transceiver, which ends its
         # remote track (W3C webrtc-pc, set the session description).
-        self.assertTrue(pc1.getTransceivers()[0].stopped)
-        self.assertEqual(pc1.getTransceivers()[0].currentDirection, "inactive")
+        self.assertTrue(pc1_transceiver.stopped)
+        self.assertEqual(pc1_transceiver.currentDirection, "inactive")
         await asyncio.wait_for(wait_for_ended(pc1_tracks[0]), 1)
+
+        # The answer removes both transceivers.
+        self.assertEqual(pc1.getTransceivers(), [])
+        self.assertEqual(pc1.getSenders(), [])
+        self.assertEqual(pc1.getReceivers(), [])
+        self.assertEqual(pc2.getTransceivers(), [])
+
+        # Renegotiation keeps their "m=" section rejected.
+        pc1.addTrack(AudioStreamTrack())
+        await negotiate(pc1, pc2)
+        self.assertEqual(media_ports(pc1.localDescription)[0], 0)
+        self.assertEqual(media_ports(pc2.localDescription)[0], 0)
+        self.assertEqual(len(pc1.getTransceivers()), 1)
+        self.assertEqual(len(pc2.getTransceivers()), 1)
 
         await pc1.close()
         await pc2.close()
@@ -2291,25 +2309,41 @@ a=rtpmap:8 PCMA/8000
         await negotiate(pc1, pc2)
         await self.assertIceCompleted(pc1, pc2)
 
-        # The offer rejects the "m=" section of the stopped transceiver, without
+        # The offer rejects the "m=" section of the stopping transceiver, without
         # its "a=msid" line (RFC 9429 section 5.2.2), and so does the answer.
-        await pc1.getTransceivers()[0].stop()
+        pc1_transceiver = pc1.getTransceivers()[0]
+        await pc1_transceiver.stop()
         await pc1.setLocalDescription(await pc1.createOffer())
         self.assertEqual(media_ports(pc1.localDescription), [0])
         self.assertEqual(bundle_groups(pc1.localDescription), [])
         self.assertNotIn("a=msid:", pc1.localDescription.sdp)
-
-        await pc2.setRemoteDescription(pc1.localDescription)
-        await pc2.setLocalDescription(await pc2.createAnswer())
-        await pc1.setRemoteDescription(pc2.localDescription)
-        self.assertEqual(media_ports(pc2.localDescription), [0])
-        self.assertEqual(bundle_groups(pc2.localDescription), [])
+        self.assertFalse(pc1_transceiver.stopped)
+        self.assertEqual(pc1.getSenders(), [pc1_transceiver.sender])
 
         # Applying the offer stops the answerer's transceiver, which ends its
         # remote track (W3C webrtc-pc, set the session description).
-        self.assertTrue(pc2.getTransceivers()[0].stopped)
-        self.assertEqual(pc2.getTransceivers()[0].currentDirection, "inactive")
+        pc2_transceiver = pc2.getTransceivers()[0]
+        await pc2.setRemoteDescription(pc1.localDescription)
+        self.assertTrue(pc2_transceiver.stopped)
         await asyncio.wait_for(wait_for_ended(pc2_tracks[0]), 1)
+
+        # The stopped transceiver has no sender or receiver, and is only removed
+        # once an answer is applied.
+        self.assertEqual(pc2.getTransceivers(), [pc2_transceiver])
+        self.assertEqual(pc2.getSenders(), [])
+        self.assertEqual(pc2.getReceivers(), [])
+        await pc2.setLocalDescription(await pc2.createAnswer())
+        self.assertEqual(media_ports(pc2.localDescription), [0])
+        self.assertEqual(bundle_groups(pc2.localDescription), [])
+        self.assertEqual(pc2_transceiver.currentDirection, "inactive")
+        self.assertEqual(pc2.getTransceivers(), [])
+
+        # Applying the answer stops and removes the offerer's transceiver.
+        self.assertEqual(pc1.getTransceivers(), [pc1_transceiver])
+        await pc1.setRemoteDescription(pc2.localDescription)
+        self.assertTrue(pc1_transceiver.stopped)
+        self.assertEqual(pc1.getSenders(), [])
+        self.assertEqual(pc1.getTransceivers(), [])
 
         await pc1.close()
         await pc2.close()
@@ -2336,17 +2370,23 @@ a=rtpmap:8 PCMA/8000
         await pc2.setRemoteDescription(
             RTCSessionDescription(sdp=str(parsed), type="offer")
         )
-        await pc2.setLocalDescription(await pc2.createAnswer())
-        self.assertEqual(media_ports(pc2.localDescription)[0], 0)
-        self.assertEqual(bundle_groups(pc2.localDescription), [[accepted_mid]])
 
         # pc2's transceiver is used for the accepted "m=" section, and a new
         # stopped one for the rejected "m=" section.
         self.assertEqual(transceiver.mid, accepted_mid)
         self.assertFalse(transceiver.stopped)
         self.assertEqual(
-            [(t.mid, t.stopped, t.currentDirection) for t in pc2.getTransceivers()],
-            [(accepted_mid, False, "sendrecv"), (rejected_mid, True, "inactive")],
+            [(t.mid, t.stopped) for t in pc2.getTransceivers()],
+            [(accepted_mid, False), (rejected_mid, True)],
+        )
+
+        # The answer removes the stopped one.
+        await pc2.setLocalDescription(await pc2.createAnswer())
+        self.assertEqual(media_ports(pc2.localDescription)[0], 0)
+        self.assertEqual(bundle_groups(pc2.localDescription), [[accepted_mid]])
+        self.assertEqual(
+            [(t.mid, t.currentDirection) for t in pc2.getTransceivers()],
+            [(accepted_mid, "sendrecv")],
         )
 
         # The connection is established, and the accepted "m=" section's media
@@ -2576,7 +2616,7 @@ a=rtpmap:8 PCMA/8000
         pc2 = RTCPeerConnection()
 
         def receiving() -> list[bool]:
-            return [bool(r.getSynchronizationSources()) for r in pc2.getReceivers()]
+            return [bool(r.getSynchronizationSources()) for r in receivers]
 
         # Advertise SSRCs which pc1 does not send, as an SFU does before it
         # reuses the "m=" sections for new participants.
@@ -2594,6 +2634,7 @@ a=rtpmap:8 PCMA/8000
         await pc2.setLocalDescription(await pc2.createAnswer())
         await pc1.setRemoteDescription(pc2.localDescription)
         await self.assertIceCompleted(pc1, pc2)
+        receivers = pc2.getReceivers()
 
         # The tracks share payload types, so their RTP cannot be routed.
         await asyncio.sleep(0.5)

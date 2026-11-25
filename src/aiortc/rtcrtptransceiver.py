@@ -36,6 +36,7 @@ class RTCRtpTransceiver:
         self.__receiver = receiver
         self.__sender = sender
         self.__stopped = False
+        self.__stopping = False
 
         self._offerDirection: Optional[str] = None
         self._preferred_codecs: list[RTCRtpCodecCapability] = []
@@ -96,7 +97,15 @@ class RTCRtpTransceiver:
 
     @property
     def stopped(self) -> bool:
+        """
+        Whether the transceiver is stopped, which happens once its "m=" section
+        is rejected.
+        """
         return self.__stopped
+
+    @property
+    def _stopping(self) -> bool:
+        return self.__stopping
 
     def setCodecPreferences(self, codecs: list[RTCRtpCodecCapability]) -> None:
         """
@@ -122,10 +131,16 @@ class RTCRtpTransceiver:
 
     async def stop(self) -> None:
         """
-        Permanently stops the :class:`RTCRtpTransceiver`.
+        Permanently stops sending and receiving. The :class:`RTCRtpTransceiver`
+        is stopped once negotiation rejects its "m=" section.
         """
-        await self.__receiver.stop()
-        await self.__sender.stop()
+        if not self.__stopping:
+            await self.__receiver.stop()
+            await self.__sender.stop()
+            self.__stopping = True
+
+    async def _stop(self) -> None:
+        await self.stop()
         self.__stopped = True
 
     def _setCurrentDirection(self, direction: str) -> None:
