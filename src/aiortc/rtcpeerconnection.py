@@ -38,7 +38,12 @@ from .rtcrtpparameters import (
 from .rtcrtpreceiver import RemoteStreamTrack, RTCRtpReceiver
 from .rtcrtpsender import RTCRtpSender
 from .rtcrtptransceiver import RTCRtpTransceiver
-from .rtcsctptransport import RTCSctpCapabilities, RTCSctpTransport
+from .rtcsctptransport import (
+    InitChunk,
+    RTCSctpCapabilities,
+    RTCSctpTransport,
+    parse_init_chunk,
+)
 from .rtcsessiondescription import RTCSessionDescription
 from .stats import RTCStatsReport
 
@@ -228,7 +233,7 @@ def allocate_mid(mids: set[str]) -> str:
 
 
 def create_media_description_for_sctp(
-    sctp: RTCSctpTransport, legacy: bool, mid: str
+    sctp: RTCSctpTransport, legacy: bool, mid: str, init: bool
 ) -> sdp.MediaDescription:
     if legacy:
         media = sdp.MediaDescription(
@@ -243,6 +248,8 @@ def create_media_description_for_sctp(
             fmt=["webrtc-datachannel"],
         )
         media.sctp_port = sctp.port
+        if init:
+            media.sctp_init = sctp._get_local_init()
 
     media.rtp.muxId = mid
     media.sctpCapabilities = sctp.getCapabilities()
@@ -425,8 +432,13 @@ class RTCPeerConnection(AsyncIOEventEmitter):
         # By default we use "UDP/DTLS/SCTP" in our SDP, but we also
         # accept "DTLS/SCTP" from older browsers.
         self._sctpLegacySdp = False
+        # Exchange the SCTP INIT chunks in SDP, see draft-hancke-tsvwg-snap.
+        self._sctpSnap = False
         self.__sctpRemotePort: Optional[int] = None
         self.__sctpRemoteCaps: Optional[RTCSctpCapabilities] = None
+        # Whether the SCTP INIT chunks were exchanged in SDP, once negotiated.
+        self.__sctpInitNegotiated: Optional[bool] = None
+        self.__sctpRemoteInit: Optional[bytes] = None
         self.__stream_id = str(uuid.uuid4())
         self.__transceivers: list[RTCRtpTransceiver] = []
 
@@ -708,7 +720,10 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                 dtlsTransport = transceiver.receiver.transport
             else:
                 media = create_media_description_for_sctp(
-                    self.__sctp, legacy=self._sctpLegacySdp, mid=self.__sctp.mid
+                    self.__sctp,
+                    legacy=self._sctpLegacySdp,
+                    mid=self.__sctp.mid,
+                    init=self.__sctpRemoteInit is not None,
                 )
                 dtlsTransport = self.__sctp.transport
 
@@ -822,7 +837,10 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                 self.__sctp_mline_index = i
                 description.media.append(
                     create_media_description_for_sctp(
-                        self.__sctp, legacy=self._sctpLegacySdp, mid=mid
+                        self.__sctp,
+                        legacy=self._sctpLegacySdp,
+                        mid=mid,
+                        init=self._sctpSnap and self.__sctpInitNegotiated is not False,
                     )
                 )
 
@@ -834,7 +852,10 @@ class RTCPeerConnection(AsyncIOEventEmitter):
             self.__sctp_mline_index = next_mline_index()
             description.media.append(
                 create_media_description_for_sctp(
-                    self.__sctp, legacy=self._sctpLegacySdp, mid=allocate_mid(mids)
+                    self.__sctp,
+                    legacy=self._sctpLegacySdp,
+                    mid=allocate_mid(mids),
+                    init=self._sctpSnap and self.__sctpInitNegotiated is not False,
                 )
             )
 
@@ -971,6 +992,10 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                     transceiver.receiver.transport._set_role(media.dtls.role)
                 elif media.kind == "application":
                     self.__sctp.transport._set_role(media.dtls.role)
+                    if self.__sctpInitNegotiated is None:
+                        self.__sctpInitNegotiated = media.sctp_init is not None
+                    if media.sctp_init is None:
+                        self.__sctp._remote_init = None
 
         # Configure the directions, which are inactive for stopped transceivers.
         for t in self.__transceivers:
@@ -1029,6 +1054,7 @@ class RTCPeerConnection(AsyncIOEventEmitter):
         description = sdp.SessionDescription.parse(sessionDescription.sdp)
         description.type = sessionDescription.type
         self.__validate_description(description, is_local=False)
+        sctpRemoteInit = self.__validateRemoteSctpInit(description)
 
         # apply description
         iceCandidates: dict[RTCIceTransport, sdp.MediaDescription] = {}
@@ -1128,6 +1154,11 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                     self._sctpLegacySdp = False
                     self.__sctpRemotePort = media.sctp_port
                 self.__sctpRemoteCaps = media.sctpCapabilities
+                if sctpRemoteInit is not None:
+                    self.__sctpRemoteInit = media.sctp_init
+                    self.__sctp._remote_init = sctpRemoteInit
+                if description.type == "answer" and self.__sctpInitNegotiated is None:
+                    self.__sctpInitNegotiated = sctpRemoteInit is not None
 
                 # memorise transport parameters
                 dtlsTransport = self.__sctp.transport
@@ -1265,6 +1296,35 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                     await self.__sctp.start(
                         self.__sctpRemoteCaps, self.__sctpRemotePort
                     )
+
+    def __validateRemoteSctpInit(
+        self, description: sdp.SessionDescription
+    ) -> Optional[InitChunk]:
+        """
+        Parse the remote SCTP INIT chunk, see draft-hancke-tsvwg-snap.
+        """
+        if not self._sctpSnap:
+            return None
+        for media in description.media:
+            if (
+                media.kind != "application"
+                or media.profile == "DTLS/SCTP"
+                or media.sctp_init is None
+            ):
+                continue
+            if self.__sctpInitNegotiated is False:
+                raise InvalidAccessError(
+                    "Cannot add an sctp-init attribute to an existing SCTP association"
+                )
+            if self.__sctpInitNegotiated and media.sctp_init != self.__sctpRemoteInit:
+                raise InvalidAccessError(
+                    "Cannot change the sctp-init attribute of an SCTP association"
+                )
+            try:
+                return parse_init_chunk(media.sctp_init)
+            except ValueError as exc:
+                raise OperationError(f"Invalid sctp-init attribute: {exc}") from None
+        return None
 
     async def __gather(self) -> None:
         coros = map(lambda t: t.iceGatherer.gather(), self.__iceTransports)

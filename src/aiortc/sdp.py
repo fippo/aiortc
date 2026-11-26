@@ -1,3 +1,5 @@
+import base64
+import binascii
 import enum
 import ipaddress
 import re
@@ -362,6 +364,7 @@ class MediaDescription:
 
         # SCTP
         self.sctpCapabilities: Optional[RTCSctpCapabilities] = None
+        self.sctp_init: Optional[bytes] = None
         self.sctpmap: dict[int, str] = {}
         self.sctp_port: Optional[int] = None
 
@@ -432,6 +435,8 @@ class MediaDescription:
             lines.append(f"a=sctp-port:{self.sctp_port}")
         if self.sctpCapabilities is not None:
             lines.append(f"a=max-message-size:{self.sctpCapabilities.maxMessageSize}")
+        if self.sctp_init is not None:
+            lines.append(f"a=sctp-init:{base64.b64encode(self.sctp_init).decode()}")
 
         # ice
         for candidate in self.ice_candidates:
@@ -661,6 +666,15 @@ class SessionDescription:
                             attr, value, minimum=2, maximum=2
                         )
                         current_media.sctpmap[port_from_sdp(format_id)] = format_desc
+                    elif attr == "sctp-init":
+                        try:
+                            current_media.sctp_init = base64.b64decode(
+                                value, validate=True
+                            )
+                        except binascii.Error:
+                            raise ValueError(
+                                f"Invalid sctp-init attribute: {value}"
+                            ) from None
                     elif attr == "sctp-port":
                         current_media.sctp_port = port_from_sdp(value)
                     elif attr == "ssrc-group":

@@ -2312,6 +2312,8 @@ a=rtpmap:111 opus/48000/2
             ("a=rtpmap", "Invalid rtpmap attribute: "),
             ("a=rtpmap:111", "Invalid rtpmap attribute: 111"),
             ("a=rtpmap:111 opus", "Invalid rtpmap attribute: opus"),
+            ("a=sctp-init:AQ=", "Invalid sctp-init attribute: AQ="),
+            ("a=sctp-init:AQ A=", "Invalid sctp-init attribute: AQ A="),
             ("a=sctpmap", "Invalid sctpmap attribute: "),
             ("a=sctpmap:5000", "Invalid sctpmap attribute: 5000"),
             ("a=setup", "Invalid setup attribute: "),
@@ -2434,6 +2436,26 @@ a=ssrc:2 cname
             d.media[0].ssrc,
             [SsrcDescription(ssrc=1, cname="bar"), SsrcDescription(ssrc=2)],
         )
+
+    def test_sctp_init(self) -> None:
+        sdp = lf2crlf(
+            """v=0
+o=- 0 0 IN IP4 127.0.0.1
+s=-
+t=0 0
+m=application 9 UDP/DTLS/SCTP webrtc-datachannel
+a=sctp-port:5000
+a=max-message-size:262144
+a=sctp-init:AQAAHols3R0AUAAA/////+B5ZR3AAAAEgAgABoLA
+"""
+        )
+        d = SessionDescription.parse(sdp)
+        self.assertEqual(
+            d.media[0].sctp_init,
+            b"\x01\x00\x00\x1e\x89\x6c\xdd\x1d\x00\x50\x00\x00\xff\xff\xff\xff"
+            b"\xe0\x79\x65\x1d\xc0\x00\x00\x04\x80\x08\x00\x06\x82\xc0",
+        )
+        self.assertEqual(str(d), sdp)
 
     def test_parse_trailing_whitespace(self) -> None:
         lines = [

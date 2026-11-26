@@ -476,6 +476,35 @@ def parse_packet(data: bytes) -> tuple[int, int, int, list[Chunk]]:
     return source_port, destination_port, verification_tag, chunks
 
 
+def parse_init_chunk(data: bytes) -> "InitChunk":
+    """
+    Parse an INIT chunk signalled in SDP, see draft-hancke-tsvwg-snap.
+    """
+    if len(data) < SCTP_CHUNK_HEADER_LENGTH:
+        raise ValueError("SCTP INIT chunk is truncated")
+    chunk_type, chunk_flags, chunk_length = unpack_from("!BBH", data)
+    if chunk_type != InitChunk.type:
+        raise ValueError(f"SCTP chunk of type {chunk_type} is not an INIT")
+    # The trailing padding is optional.
+    if len(data) not in (chunk_length, chunk_length + padl(chunk_length)):
+        raise ValueError(
+            f"SCTP INIT chunk has an invalid length of {chunk_length} bytes"
+        )
+    try:
+        chunk = InitChunk(
+            flags=chunk_flags, body=data[SCTP_CHUNK_HEADER_LENGTH:chunk_length]
+        )
+    except StructError:
+        raise ValueError("SCTP INIT chunk has a truncated value") from None
+    if (
+        chunk.initiate_tag == 0
+        or chunk.outbound_streams == 0
+        or chunk.inbound_streams == 0
+    ):
+        raise ValueError("SCTP INIT chunk has invalid parameters")
+    return chunk
+
+
 def serialize_packet(
     source_port: int, destination_port: int, verification_tag: int, chunk: Chunk
 ) -> bytes:
@@ -701,7 +730,9 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         self._local_port = port
         self._local_verification_tag = random32()
 
+        self._local_init: Optional[bytes] = None
         self._remote_extensions: list[int] = []
+        self._remote_init: Optional[InitChunk] = None
         self._remote_max_message_size = REMOTE_DEFAULT_MAX_MESSAGE_SIZE
         self._remote_partial_reliability = False
         self._remote_port: Optional[int] = None
@@ -843,9 +874,14 @@ class RTCSctpTransport(AsyncIOEventEmitter):
             else:
                 self._data_channel_id = 0
 
-            # both endpoints initiate the association, see RFC 8841 section 9.3
             self.__transport._register_data_receiver(self)
-            await self._init()
+            if self._local_init is not None and self._remote_init is not None:
+                # Both INIT chunks were exchanged in SDP, see draft-hancke-tsvwg-snap.
+                self._process_remote_init(self._remote_init)
+                self._set_state(self.State.ESTABLISHED)
+            else:
+                # both endpoints initiate the association, see RFC 8841 section 9.3
+                await self._init()
 
     async def stop(self) -> None:
         """
@@ -886,10 +922,7 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         init_ack.params.append((SCTP_STATE_COOKIE, cookie))
         return init_ack
 
-    async def _init(self) -> None:
-        """
-        Initialize the association.
-        """
+    def _build_init(self) -> InitChunk:
         chunk = InitChunk()
         chunk.initiate_tag = self._local_verification_tag
         chunk.advertised_rwnd = self._advertised_rwnd
@@ -897,6 +930,21 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         chunk.inbound_streams = self._inbound_streams_max
         chunk.initial_tsn = self._local_tsn
         self._set_extensions(chunk.params)
+        return chunk
+
+    def _get_local_init(self) -> bytes:
+        """
+        Return the serialized INIT chunk to signal in SDP.
+        """
+        if self._local_init is None:
+            self._local_init = bytes(self._build_init())
+        return self._local_init
+
+    async def _init(self) -> None:
+        """
+        Initialize the association.
+        """
+        chunk = self._build_init()
         await self._send_chunk(chunk)
 
         # start T1 timer and enter COOKIE-WAIT state
@@ -947,6 +995,28 @@ class RTCSctpTransport(AsyncIOEventEmitter):
 
         extensions.append(ReconfigChunk.type)
         params.append((SCTP_SUPPORTED_CHUNK_EXT, bytes(extensions)))
+
+    def _process_remote_init(self, chunk: BaseInitChunk) -> None:
+        """
+        Configure the association from the peer's INIT or INIT ACK chunk.
+        """
+        self._last_received_tsn = tsn_minus_one(chunk.initial_tsn)
+        self._reconfig_response_seq = tsn_minus_one(chunk.initial_tsn)
+        self._remote_verification_tag = chunk.initiate_tag
+        self._ssthresh = chunk.advertised_rwnd
+        self._get_extensions(chunk.params)
+
+        self.__log_debug(
+            "- Peer supports %d outbound streams, %d max inbound streams",
+            chunk.outbound_streams,
+            chunk.inbound_streams,
+        )
+        self._inbound_streams_count = min(
+            chunk.outbound_streams, self._inbound_streams_max
+        )
+        self._outbound_streams_count = min(
+            self._outbound_streams_count, chunk.inbound_streams
+        )
 
     def _get_inbound_stream(self, stream_id: int) -> InboundStream:
         """
@@ -1153,23 +1223,7 @@ class RTCSctpTransport(AsyncIOEventEmitter):
 
         # An INIT may collide with our own (RFC 9260 section 5.2.1).
         elif isinstance(chunk, InitChunk):
-            self._last_received_tsn = tsn_minus_one(chunk.initial_tsn)
-            self._reconfig_response_seq = tsn_minus_one(chunk.initial_tsn)
-            self._remote_verification_tag = chunk.initiate_tag
-            self._ssthresh = chunk.advertised_rwnd
-            self._get_extensions(chunk.params)
-
-            self.__log_debug(
-                "- Peer supports %d outbound streams, %d max inbound streams",
-                chunk.outbound_streams,
-                chunk.inbound_streams,
-            )
-            self._inbound_streams_count = min(
-                chunk.outbound_streams, self._inbound_streams_max
-            )
-            self._outbound_streams_count = min(
-                self._outbound_streams_count, chunk.inbound_streams
-            )
+            self._process_remote_init(chunk)
 
             await self._send_chunk(self._build_init_ack(self._local_verification_tag))
         elif isinstance(chunk, CookieEchoChunk):
@@ -1203,23 +1257,7 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         ):
             # cancel T1 timer and process chunk
             self._t1_cancel()
-            self._last_received_tsn = tsn_minus_one(chunk.initial_tsn)
-            self._reconfig_response_seq = tsn_minus_one(chunk.initial_tsn)
-            self._remote_verification_tag = chunk.initiate_tag
-            self._ssthresh = chunk.advertised_rwnd
-            self._get_extensions(chunk.params)
-
-            self.__log_debug(
-                "- Peer supports %d outbound streams, %d max inbound streams",
-                chunk.outbound_streams,
-                chunk.inbound_streams,
-            )
-            self._inbound_streams_count = min(
-                chunk.outbound_streams, self._inbound_streams_max
-            )
-            self._outbound_streams_count = min(
-                self._outbound_streams_count, chunk.inbound_streams
-            )
+            self._process_remote_init(chunk)
 
             echo = CookieEchoChunk()
             for k, v in chunk.params:

@@ -14,6 +14,7 @@ from aiortc import (
     RTCIceCandidate,
     RTCIceTransportPolicy,
     RTCPeerConnection,
+    RTCSctpTransport,
     RTCSessionDescription,
 )
 from aiortc.contrib.media import MediaPlayer
@@ -115,6 +116,10 @@ async def negotiate(pc1: RTCPeerConnection, pc2: RTCPeerConnection) -> None:
     await pc2.setRemoteDescription(pc1.localDescription)
     await pc2.setLocalDescription(await pc2.createAnswer())
     await pc1.setRemoteDescription(pc2.localDescription)
+
+
+def sctp_init_lines(description: RTCSessionDescription) -> list[str]:
+    return re.findall("^a=sctp-init:.*$", description.sdp, re.M)
 
 
 async def outbound_ssrc(sender: RTCRtpSender) -> int:
@@ -4811,6 +4816,140 @@ a=rtpmap:8 PCMA/8000
             pc2_states["signalingState"],
             ["stable", "have-remote-offer", "stable", "closed"],
         )
+
+    @asynctest
+    async def test_connect_datachannel_sctp_init(self) -> None:
+        pc1 = RTCPeerConnection()
+        pc2 = RTCPeerConnection()
+        pc1._sctpSnap = True
+        pc2._sctpSnap = True
+        dc = pc1.createDataChannel("chat")
+
+        with patch.object(RTCSctpTransport, "_init") as mock_init:
+            await negotiate(pc1, pc2)
+            offer_init = sctp_init_lines(pc1.localDescription)
+            answer_init = sctp_init_lines(pc2.localDescription)
+            self.assertEqual(len(offer_init), 1)
+            self.assertEqual(len(answer_init), 1)
+            self.assertNotEqual(offer_init, answer_init)
+
+            await self.assertIceCompleted(pc1, pc2)
+            await self.assertDataChannelOpen(dc)
+            mock_init.assert_not_called()
+
+        # Subsequent offers and answers carry the same INIT chunks.
+        await negotiate(pc2, pc1)
+        self.assertEqual(sctp_init_lines(pc1.localDescription), offer_init)
+        self.assertEqual(sctp_init_lines(pc2.localDescription), answer_init)
+
+        # The INIT chunk cannot change.
+        await pc1.setLocalDescription(await pc1.createOffer())
+        offer = RTCSessionDescription(
+            sdp=pc1.localDescription.sdp.replace(offer_init[0], answer_init[0]),
+            type="offer",
+        )
+        with self.assertRaises(InvalidAccessError) as cm:
+            await pc2.setRemoteDescription(offer)
+        self.assertEqual(
+            str(cm.exception),
+            "Cannot change the sctp-init attribute of an SCTP association",
+        )
+
+        await pc1.close()
+        await pc2.close()
+
+    @asynctest
+    async def test_createOffer_datachannel_sctp_init_disabled(self) -> None:
+        pc = RTCPeerConnection()
+        pc.createDataChannel("chat")
+        self.assertEqual(sctp_init_lines(await pc.createOffer()), [])
+        await pc.close()
+
+    @asynctest
+    async def test_connect_datachannel_sctp_init_not_answered(self) -> None:
+        pc1 = RTCPeerConnection()
+        pc2 = RTCPeerConnection()
+        pc1._sctpSnap = True
+        dc = pc1.createDataChannel("chat")
+
+        # The answerer does not exchange INIT chunks in SDP.
+        await pc1.setLocalDescription(await pc1.createOffer())
+        self.assertEqual(len(sctp_init_lines(pc1.localDescription)), 1)
+        await pc2.setRemoteDescription(pc1.localDescription)
+        await pc2.setLocalDescription(await pc2.createAnswer())
+        self.assertEqual(sctp_init_lines(pc2.localDescription), [])
+        await pc1.setRemoteDescription(pc2.localDescription)
+
+        await self.assertIceCompleted(pc1, pc2)
+        await self.assertDataChannelOpen(dc)
+
+        # Subsequent offers do not add it.
+        self.assertEqual(sctp_init_lines(await pc1.createOffer()), [])
+
+        # Adding it to the existing association is an error.
+        await pc2.setLocalDescription(await pc2.createOffer())
+        offer = RTCSessionDescription(
+            sdp=pc2.localDescription.sdp.replace(
+                "a=sctp-port:5000\r\n",
+                "a=sctp-port:5000\r\n"
+                "a=sctp-init:AQAAHols3R0AUAAA/////+B5ZR3AAAAEgAgABoLA\r\n",
+            ),
+            type="offer",
+        )
+        with self.assertRaises(InvalidAccessError) as cm:
+            await pc1.setRemoteDescription(offer)
+        self.assertEqual(
+            str(cm.exception),
+            "Cannot add an sctp-init attribute to an existing SCTP association",
+        )
+
+        await pc1.close()
+        await pc2.close()
+
+    @asynctest
+    async def test_setRemoteDescription_sctp_init_invalid(self) -> None:
+        pc1 = RTCPeerConnection()
+        pc2 = RTCPeerConnection()
+        pc1._sctpSnap = True
+        pc2._sctpSnap = True
+        pc1.createDataChannel("chat")
+
+        def invalid(description: RTCSessionDescription) -> RTCSessionDescription:
+            # Valid base64, but the chunk is an INIT ACK.
+            return RTCSessionDescription(
+                sdp=re.sub(
+                    "a=sctp-init:.*\r\n",
+                    "a=sctp-init:AgAAHols3R0AUAAA/////+B5ZR3AAAAEgAgABoLA\r\n",
+                    description.sdp,
+                ),
+                type=description.type,
+            )
+
+        # The offer is rejected.
+        await pc1.setLocalDescription(await pc1.createOffer())
+        with self.assertRaises(OperationError) as cm:
+            await pc2.setRemoteDescription(invalid(pc1.localDescription))
+        self.assertEqual(
+            str(cm.exception),
+            "Invalid sctp-init attribute: SCTP chunk of type 2 is not an INIT",
+        )
+        self.assertEqual(pc2.signalingState, "stable")
+        self.assertIsNone(pc2.remoteDescription)
+
+        # The answer is rejected.
+        await pc2.setRemoteDescription(pc1.localDescription)
+        await pc2.setLocalDescription(await pc2.createAnswer())
+        with self.assertRaises(OperationError) as cm:
+            await pc1.setRemoteDescription(invalid(pc2.localDescription))
+        self.assertEqual(
+            str(cm.exception),
+            "Invalid sctp-init attribute: SCTP chunk of type 2 is not an INIT",
+        )
+        self.assertEqual(pc1.signalingState, "have-local-offer")
+        self.assertIsNone(pc1.remoteDescription)
+
+        await pc1.close()
+        await pc2.close()
 
     @asynctest
     async def test_connect_datachannel_recycle_stream_id(self) -> None:

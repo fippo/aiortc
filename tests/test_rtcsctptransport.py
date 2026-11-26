@@ -47,6 +47,7 @@ from aiortc.rtcsctptransport import (
     StreamAddOutgoingParam,
     StreamResetOutgoingParam,
     StreamResetResponseParam,
+    parse_init_chunk,
     parse_packet,
     serialize_packet,
     tsn_minus_one,
@@ -60,6 +61,12 @@ from .utils import (
     dummy_dtls_transport_pair,
     load,
     set_loss_pattern,
+)
+
+# The INIT chunk from draft-hancke-tsvwg-snap section 4.1.
+SNAP_INIT = (
+    b"\x01\x00\x00\x1e\x89\x6c\xdd\x1d\x00\x50\x00\x00\xff\xff\xff\xff"
+    b"\xe0\x79\x65\x1d\xc0\x00\x00\x04\x80\x08\x00\x06\x82\xc0"
 )
 
 T = TypeVar("T")
@@ -770,6 +777,51 @@ class SctpUtilTest(TestCase):
         self.assertEqual(tsn_minus_one(4294967294), 4294967293)
         self.assertEqual(tsn_minus_one(4294967295), 4294967294)
 
+    def test_parse_init_chunk(self) -> None:
+        for data in [SNAP_INIT, SNAP_INIT + b"\x00\x00"]:
+            chunk = parse_init_chunk(data)
+            self.assertEqual(chunk.initiate_tag, 0x896CDD1D)
+            self.assertEqual(chunk.advertised_rwnd, 0x00500000)
+            self.assertEqual(chunk.outbound_streams, 65535)
+            self.assertEqual(chunk.inbound_streams, 65535)
+            self.assertEqual(chunk.initial_tsn, 0xE079651D)
+            self.assertEqual(
+                chunk.params, [(SCTP_PRSCTP_SUPPORTED, b""), (32776, b"\x82\xc0")]
+            )
+
+    def test_parse_init_chunk_invalid(self) -> None:
+        for data, msg in [
+            (b"\x01\x00\x00", "SCTP INIT chunk is truncated"),
+            (b"\x02" + SNAP_INIT[1:], "SCTP chunk of type 2 is not an INIT"),
+            (
+                SNAP_INIT[:-1],
+                "SCTP INIT chunk has an invalid length of 30 bytes",
+            ),
+            (
+                SNAP_INIT + b"\x00\x00\x00",
+                "SCTP INIT chunk has an invalid length of 30 bytes",
+            ),
+            (
+                b"\x01\x00\x00\x08\x00\x00\x00\x01",
+                "SCTP INIT chunk has a truncated value",
+            ),
+            (
+                SNAP_INIT[:4] + b"\x00\x00\x00\x00" + SNAP_INIT[8:],
+                "SCTP INIT chunk has invalid parameters",
+            ),
+            (
+                SNAP_INIT[:12] + b"\x00\x00" + SNAP_INIT[14:],
+                "SCTP INIT chunk has invalid parameters",
+            ),
+            (
+                SNAP_INIT[:20] + b"\xc0\x00\x00\x10" + SNAP_INIT[24:],
+                "SCTP parameter has an invalid length of 16 bytes",
+            ),
+        ]:
+            with self.assertRaises(ValueError) as cm:
+                parse_init_chunk(data)
+            self.assertEqual(str(cm.exception), msg)
+
     def test_tsn_plus_one(self) -> None:
         self.assertEqual(tsn_plus_one(0), 1)
         self.assertEqual(tsn_plus_one(1), 2)
@@ -990,6 +1042,49 @@ class RTCSctpTransportTest(TestCase):
             self.assertEqual(server._remote_extensions, [192, 130])
 
             await asyncio.sleep(0.1)
+
+    @asynctest
+    async def test_connect_with_init_in_sdp(self) -> None:
+        async with client_and_server() as (client, server):
+            server_channels = track_channels(server)
+            server._inbound_streams_max = 2048
+            client_states = track_states(client)
+
+            client._remote_init = parse_init_chunk(server._get_local_init())
+            server._remote_init = parse_init_chunk(client._get_local_init())
+            self.assertEqual(client._get_local_init(), client._get_local_init())
+
+            # No handshake takes place.
+            await server.start(client.getCapabilities(), client.port)
+            await client.start(server.getCapabilities(), server.port)
+            for transport in [client, server]:
+                self.assertEqual(
+                    transport._association_state, RTCSctpTransport.State.ESTABLISHED
+                )
+                self.assertEqual(transport.state, "connected")
+                self.assertIsNone(transport._t1_handle)
+                self.assertEqual(transport._remote_extensions, [192, 130])
+                self.assertTrue(transport._remote_partial_reliability)
+            self.assertEqual(
+                client._remote_verification_tag, server._local_verification_tag
+            )
+            self.assertEqual(
+                server._remote_verification_tag, client._local_verification_tag
+            )
+            self.assertEqual(client._inbound_streams_count, 65535)
+            self.assertEqual(client._outbound_streams_count, 2048)
+            self.assertEqual(server._inbound_streams_count, 2048)
+            self.assertEqual(server._outbound_streams_count, 65535)
+
+            channel = RTCDataChannel(client, RTCDataChannelParameters(label="chat"))
+            await asyncio.sleep(0.1)
+            self.assertEqual(channel.readyState, "open")
+            self.assertEqual(len(server_channels), 1)
+            self.assertEqual(server_channels[0].label, "chat")
+
+            await client.stop()
+            self.assertEqual(client.state, "closed")
+            self.assertEqual(client_states, ["connecting", "connected"])
 
     @asynctest
     async def test_connect_then_server_stops(self) -> None:
